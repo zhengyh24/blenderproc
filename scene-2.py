@@ -9,6 +9,7 @@ from pathlib import Path
 
 import bpy
 import numpy as np
+import mathutils
 from mathutils import Vector
 
 
@@ -38,6 +39,31 @@ base.Cfg.CAM_ELEV_DEG_MIN = 15.0
 base.Cfg.CAM_ELEV_DEG_MAX = 40.0
 
 _original_randomize_part_material = base.randomize_part_material
+
+
+def randomize_part_material_patched(mesh_obj):
+    # 1. 先执行原版逻辑，获取底色和基础节点
+    _original_randomize_part_material(mesh_obj)
+
+    # 2. 拦截并覆写 PBR 物理参数（阳极氧化/喷砂金属）
+    bo = base.get_blender_obj(mesh_obj)
+    for mat in bo.data.materials:
+        if mat and mat.use_nodes and mat.node_tree is not None:
+            for node in mat.node_tree.nodes:
+                if node.type != "BSDF_PRINCIPLED":
+                    continue
+
+                metallic_in = node.inputs.get("Metallic")
+                if metallic_in is not None and float(metallic_in.default_value) < 0.5:
+                    metallic_in.default_value = random.uniform(0.8, 1.0)
+
+                rough_in = node.inputs.get("Roughness")
+                if rough_in is not None:
+                    rough_in.default_value = random.uniform(0.45, 0.65)
+
+                spec_ior_in = node.inputs.get("Specular IOR Level")
+                if spec_ior_in is not None:
+                    spec_ior_in.default_value = random.uniform(0.2, 0.3)
 
 
 def _augment_model_stats_from_info(info_path: Path, model_stats: dict):
@@ -300,44 +326,24 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
             bo.rigid_body.linear_damping = 0.4
             bo.rigid_body.angular_damping = 0.4
 
-
-def randomize_part_material_patched(mesh_obj):
-    _original_randomize_part_material(mesh_obj)
-    bo = base.get_blender_obj(mesh_obj)
-    for mat in bo.data.materials:
-        if mat is None or not mat.use_nodes or mat.node_tree is None:
-            continue
-        for node in mat.node_tree.nodes:
-            if node.type != "BSDF_PRINCIPLED":
-                continue
-            metallic_in = node.inputs.get("Metallic")
-            if metallic_in is not None:
-                metallic_in.default_value = random.uniform(0.0, 0.2)
-            rough_in = node.inputs.get("Roughness")
-            if rough_in is not None:
-                rough_in.default_value = random.uniform(0.5, 0.8)
-            spec_in = node.inputs.get("Specular IOR Level")
-            if spec_in is not None:
-                spec_in.default_value = 0.1
-
-
 def configure_background_and_lights_patched(haven_path, lights, focus_point):
-    bproc.renderer.set_world_background([0.12, 0.12, 0.12], strength=0.8)
+    # 极限压暗：尽量切断环境泛光
+    bproc.renderer.set_world_background([0.12, 0.12, 0.12], strength=0.02)
     fp = np.asarray(focus_point, dtype=float)
 
     lights["top"].set_location([float(fp[0]), float(fp[1]), float(fp[2]) + 0.85])
-    lights["top"].set_radius(random.uniform(2.0, 4.0))
-    lights["top"].set_energy(random.uniform(10.0, 20.0))
+    lights["top"].set_radius(random.uniform(1.0, 2.5))
+    lights["top"].set_energy(random.uniform(45.0, 140.0))
     lights["top"].set_color([1.0, 0.98, 0.95])
 
     lights["fill"].set_location([float(fp[0]) + 0.6, float(fp[1]) + 0.6, float(fp[2]) + 0.35])
-    lights["fill"].set_radius(random.uniform(2.0, 4.0))
-    lights["fill"].set_energy(random.uniform(10.0, 20.0))
+    lights["fill"].set_radius(random.uniform(1.0, 2.5))
+    lights["fill"].set_energy(random.uniform(14.0, 54.0))
     lights["fill"].set_color([1.0, 0.98, 0.95])
 
     lights["rim"].set_location([float(fp[0]) - 0.6, float(fp[1]) - 0.6, float(fp[2]) + 0.35])
-    lights["rim"].set_radius(random.uniform(2.0, 4.0))
-    lights["rim"].set_energy(random.uniform(10.0, 20.0))
+    lights["rim"].set_radius(random.uniform(1.0, 2.5))
+    lights["rim"].set_energy(random.uniform(14.0, 54.0))
     lights["rim"].set_color([1.0, 0.98, 0.95])
 
 
@@ -345,11 +351,49 @@ def create_funnel_air_walls_patched(target_state: dict):
     return []
 
 
+_original_sample_worker_camera = base.sample_worker_camera
+
+
+def sample_worker_camera_patched(target_obj, target_state, scene_objs, focus_point):
+    camera_info = _original_sample_worker_camera(target_obj, target_state, scene_objs, focus_point)
+
+    # 最直接的全局压亮度手段：压曝光（避免地面/金属泛白）
+    try:
+        bpy.context.scene.view_settings.exposure = 0.6
+    except Exception:
+        pass
+
+    cam = bpy.context.scene.camera
+    cam_loc_vec = cam.matrix_world.to_translation()
+    cam_axes = cam.matrix_world.to_3x3()
+    cam_right = cam_axes @ mathutils.Vector((1.0, 0.0, 0.0))
+    cam_up = cam_axes @ mathutils.Vector((0.0, 1.0, 0.0))
+    cam_back = cam_axes @ mathutils.Vector((0.0, 0.0, 1.0))
+
+    fp = np.asarray(focus_point, dtype=float)
+    area_lights = [obj for obj in bpy.data.objects if obj.type == "LIGHT" and obj.data.type == "AREA"]
+    if len(area_lights) >= 3:
+        l0, l1, l2 = area_lights[0], area_lights[1], area_lights[2]
+
+        # 主光：相机左侧 1.5m，上方 3.0m
+        l0.location = cam_loc_vec - cam_right * 1.5 + cam_up * 3.0
+        # 辅光：相机右侧 1.5m，上方 1.0m
+        l1.location = cam_loc_vec + cam_right * 1.5 + cam_up * 1.0
+        # 轮廓光：目标后方 4.0m，高度 1.5m
+        l2.location = mathutils.Vector((fp[0], fp[1], fp[2])) - cam_back * 4.0 + mathutils.Vector((0.0, 0.0, 1.5))
+
+        for light in (l0, l1, l2):
+            light.rotation_euler = (mathutils.Vector((fp[0], fp[1], fp[2])) - light.location).to_track_quat("-Z", "Y").to_euler()
+
+    return camera_info
+
+
 base.load_scene_objects = load_scene_objects_patched
 base.arrange_distractors = arrange_distractors_patched
 base.randomize_part_material = randomize_part_material_patched
 base.configure_background_and_lights = configure_background_and_lights_patched
 base.create_funnel_air_walls = create_funnel_air_walls_patched
+base.sample_worker_camera = sample_worker_camera_patched
 
 
 if __name__ == "__main__":
