@@ -30,9 +30,9 @@ def _load_base_scene_module():
 
 base = _load_base_scene_module()
 
-# 1) 覆写核心参数：28 物体（1 目标 + 27 干扰）+ 抬高相机视角
-base.Cfg.N_OBJ_MIN = 28
-base.Cfg.N_OBJ_MAX = 28
+# 1) 覆写核心参数：31 物体（1 目标 + 30 干扰）+ 抬高相机视角
+base.Cfg.N_OBJ_MIN = 31
+base.Cfg.N_OBJ_MAX = 31
 base.Cfg.CAM_DIST_MIN = 0.6
 base.Cfg.CAM_DIST_MAX = 1.0
 base.Cfg.CAM_ELEV_DEG_MIN = 15.0
@@ -109,9 +109,14 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
     if cad_dir is None:
         raise FileNotFoundError(f"models_cad 目录不存在，已尝试: {cad_dir_candidates}")
 
-    simple_plys = sorted(simple_dir.glob("*.ply"))
-    cad_plys = sorted(cad_dir.glob("*.ply"))
-    simple_pool = [p for p in simple_plys if p.name != base.TARGET_PLY]
+    # 注意：Linux 上 glob("*.ply") 不匹配 ".PLY"；这里做大小写无关收集
+    simple_plys = sorted([p for p in simple_dir.iterdir() if p.is_file() and p.suffix.lower() == ".ply"])
+    cad_plys = sorted([p for p in cad_dir.iterdir() if p.is_file() and p.suffix.lower() == ".ply"])
+    pipe_filenames = ["1.ply", "2.ply", "3.ply"]
+    simple_pool = [p for p in simple_plys if p.name != base.TARGET_PLY and p.name.lower() not in pipe_filenames]
+    pipe_paths = [p for p in simple_plys if p.name.lower() in pipe_filenames]
+    if len(pipe_paths) != 3:
+        print(f"警告：未找全 1.PLY, 2.PLY, 3.PLY，目前找到 {len(pipe_paths)} 个")
     cad_pool = [p for p in cad_plys if p.name != base.TARGET_PLY]
     if len(simple_pool) < 9:
         raise RuntimeError(f"models_simple 中可用干扰 .ply 不足 9，当前 {len(simple_pool)}")
@@ -150,21 +155,25 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
         if not loaded:
             return
         obj = loaded[0]
+
         base.setup_mesh_obj(obj, scale, base.CATEGORY_DISTRACTOR, cad_path.name)
         obj.set_name(f"mesh_{prefix}_{cad_path.stem}")
         base.randomize_part_material(obj)
         distractor_objs[unique_name] = obj
         loaded_objs.append(obj)
-        if cad_path.name not in model_stats:
+
+        # 为管道等“非 obj_*.ply”模型补齐尺寸统计；同时写入小写 key，便于后续用 "1.ply" 访问
+        base_key = cad_path.name.lower()
+        if base_key not in model_stats:
             bo = base.get_blender_obj(obj)
             dims = np.array([float(bo.dimensions.x), float(bo.dimensions.y), float(bo.dimensions.z)], dtype=np.float32)
-            model_stats[cad_path.name] = {
+            model_stats[base_key] = {
                 "size": dims,
                 "diameter": float(np.linalg.norm(dims)),
             }
         model_stats[unique_name] = {
-            "size": np.array(model_stats[cad_path.name]["size"], dtype=np.float32),
-            "diameter": float(model_stats[cad_path.name]["diameter"]),
+            "size": np.array(model_stats[base_key]["size"], dtype=np.float32),
+            "diameter": float(model_stats[base_key]["diameter"]),
         }
         selected_names.append(unique_name)
 
@@ -174,9 +183,11 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
         add_distractor(cad_path, "cad2")
     for cad_path in selected_cad3:
         add_distractor(cad_path, "cad3")
-
-    if len(distractor_objs) != 27:
-        raise RuntimeError(f"干扰物加载数量异常，期望 27，实际 {len(distractor_objs)}")
+    for pipe_path in pipe_paths:
+        add_distractor(pipe_path, "pipe")
+    expected = 27 + len(pipe_paths)
+    if len(distractor_objs) != expected:
+        raise RuntimeError(f"干扰物加载数量异常，期望 {expected}，实际 {len(distractor_objs)}")
 
     for obj in loaded_objs:
         obj.enable_rigidbody(active=True, collision_shape="CONVEX_HULL")
@@ -282,6 +293,35 @@ def _scene_global_max_z(distractor_objs: dict, wave_names: list[str], include_ta
     return max(zs) if zs else base.Cfg.TABLE_Z_TOP
 
 
+def compute_scene_focus_point_patched(scene_objs: list, target_state: dict) -> tuple[np.ndarray, float]:
+    # 强行将视觉中心锁定在目标零件的 XY 坐标以及它稍微偏上的 Z 高度
+    focus = np.array(
+        [
+            float(target_state["location"][0]),
+            float(target_state["location"][1]),
+            float(target_state["location"][2]) + float(target_state["size_m"][2]) * 0.5,
+        ],
+        dtype=float,
+    )
+
+    # 计算场景的近似最大高度，供给相机调整焦距使用
+    zs = [float(target_state["location"][2])]
+    for obj in scene_objs:
+        if obj is None:
+            continue
+        try:
+            bo = base.get_blender_obj(obj)
+            if not bo.hide_render:
+                for corner in bo.bound_box:
+                    p = bo.matrix_world @ mathutils.Vector(corner)
+                    zs.append(float(p.z))
+        except Exception:
+            pass
+    pile_h = max(zs) - min(zs) if zs else float(target_state["size_m"][2])
+
+    return focus, float(pile_h)
+
+
 def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
                                 model_stats: dict, scale: float, target_size_m: np.ndarray):
     for _, obj in distractor_objs.items():
@@ -298,6 +338,7 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
     wave1_names = [n for n in active_names if n.startswith("simple_")]
     wave2_names = [n for n in active_names if n.startswith("cad2_")]
     wave3_names = [n for n in active_names if n.startswith("cad3_")]
+    wave4_names = [n for n in active_names if n.startswith("pipe_")]
 
     tx, ty = 0.0, 0.0
     for bo in bpy.data.objects:
@@ -329,12 +370,24 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
         check_object_interval=0.5,
     )
 
-    # 第三波：9 个 cad3，铺在前两座山上方
+    # 第三波：9 个 cad3，铺在前两座山上方 + 强制中途结算第三波
     global_max_z3 = _scene_global_max_z(distractor_objs, wave1_names + wave2_names, include_target=True)
     base_z_wave3 = global_max_z3 + 0.02
-    _place_wave(tx, ty, wave3_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave3, 0.4)
+    _place_wave(tx, ty, wave3_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave3, 0.5)
 
-    # 为所有 27 个干扰物统一设小阻尼
+    # 强制中途结算第三波
+    bproc.object.simulate_physics_and_fix_final_poses(
+        min_simulation_time=1.0,
+        max_simulation_time=2.0,
+        check_object_interval=0.5,
+    )
+
+    # 第四波：管道（pipe_），铺在前三座山上方
+    global_max_z4 = _scene_global_max_z(distractor_objs, wave1_names + wave2_names + wave3_names, include_target=True)
+    base_z_wave4 = global_max_z4 + 0.02
+    _place_wave(tx, ty, wave4_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave4, 0.4)
+
+    # 为所有干扰物统一设小阻尼
     for _, obj in distractor_objs.items():
         bo = base.get_blender_obj(obj)
         if bo.rigid_body is not None:
@@ -409,6 +462,7 @@ base.randomize_part_material = randomize_part_material_patched
 base.configure_background_and_lights = configure_background_and_lights_patched
 base.create_funnel_air_walls = create_funnel_air_walls_patched
 base.sample_worker_camera = sample_worker_camera_patched
+base.compute_scene_focus_point = compute_scene_focus_point_patched
 
 
 if __name__ == "__main__":
