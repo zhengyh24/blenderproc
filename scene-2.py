@@ -30,9 +30,9 @@ def _load_base_scene_module():
 
 base = _load_base_scene_module()
 
-# 1) 覆写核心参数：19 物体 + 抬高相机视角
-base.Cfg.N_OBJ_MIN = 19
-base.Cfg.N_OBJ_MAX = 19
+# 1) 覆写核心参数：28 物体（1 目标 + 27 干扰）+ 抬高相机视角
+base.Cfg.N_OBJ_MIN = 28
+base.Cfg.N_OBJ_MAX = 28
 base.Cfg.CAM_DIST_MIN = 0.6
 base.Cfg.CAM_DIST_MAX = 1.0
 base.Cfg.CAM_ELEV_DEG_MIN = 15.0
@@ -115,11 +115,13 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
     cad_pool = [p for p in cad_plys if p.name != base.TARGET_PLY]
     if len(simple_pool) < 9:
         raise RuntimeError(f"models_simple 中可用干扰 .ply 不足 9，当前 {len(simple_pool)}")
-    if len(cad_pool) < 9:
-        raise RuntimeError(f"models_cad 中可用干扰 .ply 不足 9，当前 {len(cad_pool)}")
+    if len(cad_pool) < 18:
+        raise RuntimeError(f"models_cad 中可用干扰 .ply 不足 18，当前 {len(cad_pool)}")
 
     selected_simple = random.sample(simple_pool, 9)
-    selected_cad = random.sample(cad_pool, 9)
+    selected_cad = random.sample(cad_pool, 18)  # 一次性抽取18个保证不重复
+    selected_cad2 = selected_cad[:9]
+    selected_cad3 = selected_cad[9:]
 
     _augment_model_stats_from_info((root / "models_simple" / "models_info.json").resolve(), model_stats)
     _augment_model_stats_from_info((root / "models-simple" / "models_info.json").resolve(), model_stats)
@@ -168,11 +170,13 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
 
     for cad_path in selected_simple:
         add_distractor(cad_path, "simple")
-    for cad_path in selected_cad:
-        add_distractor(cad_path, "cad")
+    for cad_path in selected_cad2:
+        add_distractor(cad_path, "cad2")
+    for cad_path in selected_cad3:
+        add_distractor(cad_path, "cad3")
 
-    if len(distractor_objs) != 18:
-        raise RuntimeError(f"干扰物加载数量异常，期望 18，实际 {len(distractor_objs)}")
+    if len(distractor_objs) != 27:
+        raise RuntimeError(f"干扰物加载数量异常，期望 27，实际 {len(distractor_objs)}")
 
     for obj in loaded_objs:
         obj.enable_rigidbody(active=True, collision_shape="CONVEX_HULL")
@@ -292,7 +296,8 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
                 bo.rigid_body.collision_margin = 0.001
 
     wave1_names = [n for n in active_names if n.startswith("simple_")]
-    wave2_names = [n for n in active_names if n.startswith("cad_")]
+    wave2_names = [n for n in active_names if n.startswith("cad2_")]
+    wave3_names = [n for n in active_names if n.startswith("cad3_")]
 
     tx, ty = 0.0, 0.0
     for bo in bpy.data.objects:
@@ -314,12 +319,22 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
         check_object_interval=0.5,
     )
 
-    # 第二波：9 个 cad，铺在第一座山上方
+    # 第二波：9 个 cad2，铺在第一座山上方 + 强制中途物理结算
     global_max_z = _scene_global_max_z(distractor_objs, wave1_names, include_target=True)
     base_z_wave2 = global_max_z + 0.02
-    _place_wave(tx, ty, wave2_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave2, 0.4)
+    _place_wave(tx, ty, wave2_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave2, 0.5)
+    bproc.object.simulate_physics_and_fix_final_poses(
+        min_simulation_time=1.0,
+        max_simulation_time=2.0,
+        check_object_interval=0.5,
+    )
 
-    # 为所有 18 个干扰物统一设小阻尼
+    # 第三波：9 个 cad3，铺在前两座山上方
+    global_max_z3 = _scene_global_max_z(distractor_objs, wave1_names + wave2_names, include_target=True)
+    base_z_wave3 = global_max_z3 + 0.02
+    _place_wave(tx, ty, wave3_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave3, 0.4)
+
+    # 为所有 27 个干扰物统一设小阻尼
     for _, obj in distractor_objs.items():
         bo = base.get_blender_obj(obj)
         if bo.rigid_body is not None:
@@ -328,22 +343,22 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
 
 def configure_background_and_lights_patched(haven_path, lights, focus_point):
     # 极限压暗：尽量切断环境泛光
-    bproc.renderer.set_world_background([0.12, 0.12, 0.12], strength=0.02)
+    bproc.renderer.set_world_background([0.12, 0.12, 0.12], strength=0.012)
     fp = np.asarray(focus_point, dtype=float)
 
     lights["top"].set_location([float(fp[0]), float(fp[1]), float(fp[2]) + 0.85])
     lights["top"].set_radius(random.uniform(1.0, 2.5))
-    lights["top"].set_energy(random.uniform(45.0, 140.0))
+    lights["top"].set_energy(random.uniform(34.0, 108.0))
     lights["top"].set_color([1.0, 0.98, 0.95])
 
     lights["fill"].set_location([float(fp[0]) + 0.6, float(fp[1]) + 0.6, float(fp[2]) + 0.35])
     lights["fill"].set_radius(random.uniform(1.0, 2.5))
-    lights["fill"].set_energy(random.uniform(14.0, 54.0))
+    lights["fill"].set_energy(random.uniform(10.0, 40.0))
     lights["fill"].set_color([1.0, 0.98, 0.95])
 
     lights["rim"].set_location([float(fp[0]) - 0.6, float(fp[1]) - 0.6, float(fp[2]) + 0.35])
     lights["rim"].set_radius(random.uniform(1.0, 2.5))
-    lights["rim"].set_energy(random.uniform(14.0, 54.0))
+    lights["rim"].set_energy(random.uniform(10.0, 40.0))
     lights["rim"].set_color([1.0, 0.98, 0.95])
 
 
@@ -359,7 +374,7 @@ def sample_worker_camera_patched(target_obj, target_state, scene_objs, focus_poi
 
     # 最直接的全局压亮度手段：压曝光（避免地面/金属泛白）
     try:
-        bpy.context.scene.view_settings.exposure = 0.6
+        bpy.context.scene.view_settings.exposure = 0.45
     except Exception:
         pass
 
