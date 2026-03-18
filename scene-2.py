@@ -30,9 +30,9 @@ def _load_base_scene_module():
 
 base = _load_base_scene_module()
 
-# 1) 覆写核心参数：31 物体（1 目标 + 30 干扰）+ 抬高相机视角
-base.Cfg.N_OBJ_MIN = 31
-base.Cfg.N_OBJ_MAX = 31
+# 1) 覆写核心参数：32 物体（1 目标 + 31 干扰）+ 抬高相机视角
+base.Cfg.N_OBJ_MIN = 32
+base.Cfg.N_OBJ_MAX = 32
 base.Cfg.CAM_DIST_MIN = 0.6
 base.Cfg.CAM_DIST_MAX = 1.0
 base.Cfg.CAM_ELEV_DEG_MIN = 15.0
@@ -185,9 +185,14 @@ def load_scene_objects_patched(model_dir: Path, scale: float, model_stats: dict)
         add_distractor(cad_path, "cad3")
     for pipe_path in pipe_paths:
         add_distractor(pipe_path, "pipe")
-    expected = 27 + len(pipe_paths)
-    if len(distractor_objs) != expected:
-        raise RuntimeError(f"干扰物加载数量异常，期望 {expected}，实际 {len(distractor_objs)}")
+
+    # 额外加载一根 1.ply：用于最终第五波“单根横向落下”
+    pipe_1_path = next((p for p in simple_plys if p.name.lower() == "1.ply"), None)
+    if pipe_1_path:
+        add_distractor(pipe_1_path, "final_pipe")
+
+    if len(distractor_objs) != 31:
+        raise RuntimeError(f"干扰物加载数量异常，期望 31，实际 {len(distractor_objs)}")
 
     for obj in loaded_objs:
         obj.enable_rigidbody(active=True, collision_shape="CONVEX_HULL")
@@ -339,6 +344,7 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
     wave2_names = [n for n in active_names if n.startswith("cad2_")]
     wave3_names = [n for n in active_names if n.startswith("cad3_")]
     wave4_names = [n for n in active_names if n.startswith("pipe_")]
+    wave5_names = [n for n in active_names if n.startswith("final_pipe")]
 
     tx, ty = 0.0, 0.0
     for bo in bpy.data.objects:
@@ -386,6 +392,42 @@ def arrange_distractors_patched(active_names: list[str], distractor_objs: dict,
     global_max_z4 = _scene_global_max_z(distractor_objs, wave1_names + wave2_names + wave3_names, include_target=True)
     base_z_wave4 = global_max_z4 + 0.02
     _place_wave(tx, ty, wave4_names, distractor_objs, model_stats, scale, target_size_m, base_z_wave4, 0.4)
+
+    # 第四波（Wave 4）之后：保留中途物理结算
+    bproc.object.simulate_physics_and_fix_final_poses(
+        min_simulation_time=1.0,
+        max_simulation_time=2.0,
+        check_object_interval=0.5,
+    )
+
+    # 第五波（Wave 5）：场景中心 + 前四波最高点上方，横向放置唯一一根 1.ply 管道落下
+    global_max_z5 = _scene_global_max_z(
+        distractor_objs,
+        wave1_names + wave2_names + wave3_names + wave4_names,
+        include_target=True,
+    )
+
+    if len(wave5_names) == 1:
+        pipe = distractor_objs[wave5_names[0]]
+        base.show_mesh_obj(pipe)
+
+        dr_scale = scale * random.uniform(base.Cfg.DR_SCALE_LO, base.Cfg.DR_SCALE_HI)
+        pipe.set_scale([dr_scale, dr_scale, dr_scale])
+        base.randomize_part_material(pipe)
+
+        # 计算安全高度：最高点 + 管道半径 + 2厘米安全缓冲
+        pipe_radius = (float(model_stats["1.ply"]["diameter"]) * dr_scale) / 2.0
+        z_safe = global_max_z5 + pipe_radius + 0.02
+
+        bo = base.get_blender_obj(pipe)
+        if bo.rigid_body is not None:
+            bo.rigid_body.linear_damping = 0.5
+            bo.rigid_body.angular_damping = 0.5
+
+        # 将唯一的一根管道放在正中心，横向放平
+        pipe.set_location([tx, ty, z_safe])
+        pipe.set_rotation_euler([0.0, math.pi / 2.0, 0.0])
+        base.reset_rigidbody_state(pipe)
 
     # 为所有干扰物统一设小阻尼
     for _, obj in distractor_objs.items():
